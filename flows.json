@@ -1,0 +1,1195 @@
+[
+    {
+        "id": "lr_tab",
+        "type": "tab",
+        "label": "Moniteur Arduino (MQTT)",
+        "disabled": false,
+        "info": "Dashboard Node-RED pour la carte Arduino (MQTT, prefixe LR-ambulance)",
+        "env": []
+    },
+    {
+        "id": "lr_c0",
+        "type": "comment",
+        "z": "lr_tab",
+        "name": "Dashboard MQTT : topics LR-ambulance/... (même préfixe que dans le code Arduino)",
+        "info": "1) Le sketch Arduino doit avoir #define PREFIXE \"LR-ambulance\" + ton WiFi (SSID / mot de passe).\n2) Dashboard : http://localhost:1880/lr/live\n3) Le broker est public : tout le monde peut lire/écrire sur LR-ambulance/... -> choisir un préfixe unique si besoin (rechercher/remplacer LR-ambulance dans le JSON ET dans le sketch).\n4) Seuils 50 / 80 BPM : en haut du noeud « État & décisions » (mêmes valeurs que le sketch).\n5) Sans Arduino : cliquer sur les inject « TESTS » en bas à gauche.\n6) Désactiver l'ancien onglet « Ambulance » (flows.json) : il utilise les mêmes topics.",
+        "x": 330,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "lr_c1",
+        "type": "comment",
+        "z": "lr_tab",
+        "name": "① Réception : ce que l'Arduino publie sur le broker",
+        "info": "",
+        "x": 200,
+        "y": 90,
+        "wires": []
+    },
+    {
+        "id": "lr_in0",
+        "type": "mqtt in",
+        "z": "lr_tab",
+        "name": "bpm",
+        "topic": "LR-ambulance/bpm",
+        "qos": "0",
+        "datatype": "utf8",
+        "broker": "lr_broker",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 130,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_in1",
+        "type": "mqtt in",
+        "z": "lr_tab",
+        "name": "état",
+        "topic": "LR-ambulance/etat",
+        "qos": "0",
+        "datatype": "utf8",
+        "broker": "lr_broker",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 190,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_in2",
+        "type": "mqtt in",
+        "z": "lr_tab",
+        "name": "en ligne",
+        "topic": "LR-ambulance/en_ligne",
+        "qos": "0",
+        "datatype": "utf8",
+        "broker": "lr_broker",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 250,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_fn_parse",
+        "type": "function",
+        "z": "lr_tab",
+        "name": "Analyser le message MQTT",
+        "func": "// Messages MQTT envoyes par l'Arduino -> evenements pour la fonction \"Etat & decisions\"\n// Topics lus : LR-ambulance/bpm   (nombre, 0 = pas de rythme)\n//              LR-ambulance/etat  (JSON : mode, rec, siren, badge)\n//              LR-ambulance/en_ligne ('on' / 'off', \"testament\" MQTT)\nconst sub = String(msg.topic || '').replace(/^LR-ambulance\\//, '');\nlet p = msg.payload;\nif (Buffer.isBuffer(p)) p = p.toString();\nif (typeof p === 'string') p = p.trim();\n\nif (sub === 'en_ligne') {\n    return { payload: { type: 'conn', value: String(p).toLowerCase() === 'on' } };\n}\nif (sub === 'bpm') {\n    const n = Number(p);\n    if (isNaN(n)) return null;\n    return { payload: n > 0 ? { type: 'bpm', value: Math.round(n) } : { type: 'nobeat' } };\n}\nif (sub === 'etat') {\n    let o = p;\n    if (typeof o === 'string') { try { o = JSON.parse(o); } catch (e) { return null; } }\n    if (!o || typeof o !== 'object') return null;\n    return { payload: { type: 'etat', mode: o.mode, rec: o.rec, siren: o.siren, badge: o.badge } };\n}\nreturn null;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 380,
+        "y": 160,
+        "wires": [
+            [
+                "lr_fn_state"
+            ]
+        ]
+    },
+    {
+        "id": "lr_c2",
+        "type": "comment",
+        "z": "lr_tab",
+        "name": "② Décision : état, alertes, jumeau numérique",
+        "info": "",
+        "x": 700,
+        "y": 90,
+        "wires": []
+    },
+    {
+        "id": "lr_fn_state",
+        "type": "function",
+        "z": "lr_tab",
+        "name": "État & décisions (seuils ICI)",
+        "func": "// ============ REGLAGES (identiques au code Arduino) ============\nconst SEUIL_BAS  = 50;   // BPM < 50  -> anormal (LED rouge)\nconst SEUIL_HAUT = 80;   // BPM > 80  -> anormal (LED rouge)\nconst MAX_LOG    = 40;   // evenements gardes dans le journal\n// ================================================================\n\nconst ev0 = msg.payload || {};\nconst hhmmss = () => new Date().toLocaleTimeString('fr-FR');\n\nfunction neuf() {\n    return { connected: false, mode: 1, rec: false, got: false, bpm: 0, siren: false,\n             badgeCount: 0, badgeSeen: 0, prevStatus: null,\n             stats: { min: null, max: null, sum: 0, n: 0, alerts: 0 }, log: [] };\n}\nlet S = flow.get('S') || neuf();\n\nconst journal = (level, text) => {\n    S.log.unshift({ t: hhmmss(), level, text });\n    if (S.log.length > MAX_LOG) S.log.length = MAX_LOG;\n};\nconst nouvellesStats = () => ({ min: null, max: null, sum: 0, n: 0, alerts: 0 });\nconst ANORMAL = ['arret', 'bas', 'haut'];\nconst vrai = (v) => (v === true || v === 1 || v === 'true' || v === 'on');\n\nconst bpmStatus = () => {\n    if (!S.rec) return 'none';\n    if (!S.got) return 'acq';\n    if (S.bpm <= 0) return 'arret';\n    if (S.bpm < SEUIL_BAS) return 'bas';\n    if (S.bpm > SEUIL_HAUT) return 'haut';\n    return 'normal';\n};\n\nlet clearChart = false, addPoint = false, toast = null, syncSwitches = false;\n\n// Le message \"etat\" de l'Arduino est compare a l'etat memorise -> evenements\nfunction expand(e) {\n    const out = [];\n    const mode = (e.mode === 'ambulance') ? 0 : 1;\n    const rec = vrai(e.rec), siren = vrai(e.siren);\n    const badge = Number(e.badge) || 0;\n    const scanned = badge > 0 && badge !== S.badgeSeen;\n    S.badgeSeen = badge; S.badgeCount = badge;\n    if (rec !== S.rec)   out.push({ type: 'rec', value: rec, source: scanned ? 'badge' : 'web' });\n    if (mode !== S.mode) out.push({ type: 'mode', value: mode });\n    if (siren !== S.siren) out.push({ type: 'siren', value: siren });\n    return out;\n}\n\nfunction apply(ev) {\n    if (ev.type !== 'bpm' && ev.type !== 'nobeat') syncSwitches = true;\n    switch (ev.type) {\n        case 'init': break;\n\n        case 'conn':\n            if (S.connected !== ev.value) {\n                S.connected = ev.value;\n                journal(ev.value ? 'ok' : 'err', ev.value ? 'Carte Arduino en ligne' : 'Carte Arduino hors ligne');\n                if (!ev.value) { S.rec = false; S.got = false; S.bpm = 0; S.siren = false; S.prevStatus = null; }\n            }\n            break;\n\n        case 'rec':\n            if (ev.value) {\n                S.rec = true; S.got = false; S.bpm = 0; S.prevStatus = null;\n                S.stats = nouvellesStats();\n                journal('ok', ev.source === 'badge' ? 'Badge accepté : enregistrement démarré' : 'Enregistrement démarré (dashboard)');\n                toast = { payload: 'Enregistrement BPM démarré', color: '#16a34a' };\n                clearChart = true;\n            } else {\n                const st = S.stats;\n                journal('info', st.n\n                    ? `Enregistrement terminé : moyenne ${Math.round(st.sum / st.n)} bpm (min ${st.min}, max ${st.max}), ${st.alerts} alerte(s)`\n                    : 'Enregistrement terminé');\n                S.rec = false; S.got = false; S.bpm = 0; S.prevStatus = null;\n                toast = { payload: 'Enregistrement BPM arrêté', color: '#475569' };\n            }\n            break;\n\n        case 'mode':\n            if (S.mode !== ev.value) {\n                S.mode = ev.value; S.prevStatus = null;\n                if (ev.value !== 0) S.siren = false;\n                journal('info', ev.value === 0 ? 'Mode Passage prioritaire (ambulance)' : 'Mode Suivi BPM');\n            }\n            break;\n\n        case 'siren':\n            if (S.siren !== ev.value) {\n                S.siren = ev.value;\n                journal(ev.value ? 'warn' : 'info', ev.value ? 'Sirène activée' : 'Sirène arrêtée');\n            }\n            break;\n\n        case 'bpm':\n        case 'nobeat':\n            if (!S.rec) {   // on a rate le \"demarrage\" : on se resynchronise\n                S.rec = true; S.stats = nouvellesStats();\n                journal('info', 'Enregistrement en cours détecté');\n                syncSwitches = true;\n            }\n            S.bpm = (ev.type === 'bpm') ? ev.value : 0;\n            S.got = true;\n            if (ev.type === 'bpm') {\n                const st = S.stats;\n                st.n++; st.sum += ev.value;\n                st.min = (st.min === null) ? ev.value : Math.min(st.min, ev.value);\n                st.max = (st.max === null) ? ev.value : Math.max(st.max, ev.value);\n            }\n            addPoint = true;\n            break;\n\n        case 'reset':\n            S.stats = nouvellesStats();\n            journal('info', 'Statistiques et graphique réinitialisés');\n            clearChart = true;\n            break;\n    }\n}\n\n// ---------- 1) Mise a jour de l'etat ----------\nconst TYPES = ['init', 'conn', 'rec', 'mode', 'siren', 'bpm', 'nobeat', 'reset', 'etat'];\nif (!TYPES.includes(ev0.type)) return null;\nconst events = (ev0.type === 'etat') ? expand(ev0) : [ev0];\nif (ev0.type === 'etat') syncSwitches = true;\nfor (const e of events) apply(e);\n\n// ---------- 2) Alertes (uniquement en mode BPM, comme sur l'Arduino) ----------\nif (events.some(e => ['bpm', 'nobeat', 'mode', 'rec'].includes(e.type))) {\n    const b = (S.mode === 1 && S.connected) ? bpmStatus() : null;\n    if (b !== S.prevStatus) {\n        if (ANORMAL.includes(b)) {\n            S.stats.alerts++;\n            const txt = b === 'arret' ? 'ARRÊT CARDIAQUE : aucun rythme détecté'\n                      : b === 'bas'   ? `BPM trop bas : ${S.bpm}`\n                                      : `BPM trop élevé : ${S.bpm}`;\n            journal('err', txt);\n            toast = { payload: '⚠ ' + txt, color: '#dc2626' };\n        } else if (b === 'normal' && ANORMAL.includes(S.prevStatus)) {\n            journal('ok', `Retour à la normale : ${S.bpm} bpm`);\n            toast = { payload: `Rythme normal : ${S.bpm} bpm`, color: '#16a34a' };\n        }\n        S.prevStatus = b;\n    }\n}\nflow.set('S', S);\n// ---------- 3) Construction de la vue pour le dashboard ----------\nconst b = bpmStatus();\nlet status, label, message;\nif (!S.connected)      { status = 'offline';   label = 'Carte non connectée'; message = 'La carte n’est pas connectée au broker : vérifiez le WiFi et l’alimentation de l’Arduino.'; }\nelse if (S.mode === 0) { status = 'ambulance'; label = 'Mode Ambulance';      message = S.siren ? 'Passage prioritaire : sirène ACTIVE' : 'Passage prioritaire : sirène au repos'; }\nelse if (b === 'none') { status = 'idle';      label = 'En attente de badge';  message = 'Passez un badge devant le lecteur RFID (ou utilisez l’interrupteur) pour démarrer.'; }\nelse if (b === 'acq')  { status = 'acq';       label = 'Acquisition…';         message = 'Lecture du capteur en cours, restez immobile.'; }\nelse if (b === 'arret'){ status = 'arret';     label = 'ARRÊT CARDIAQUE';      message = 'Aucun rythme détecté par le capteur !'; }\nelse if (b === 'bas')  { status = 'bas';       label = 'Rythme trop bas';      message = `Inférieur à ${SEUIL_BAS} bpm`; }\nelse if (b === 'haut') { status = 'haut';      label = 'Rythme trop élevé';    message = `Supérieur à ${SEUIL_HAUT} bpm`; }\nelse                   { status = 'normal';    label = 'Rythme normal';        message = `Entre ${SEUIL_BAS} et ${SEUIL_HAUT} bpm`; }\n\nconst beating = S.connected && S.rec && S.got && S.bpm > 0;\n\n// Jumeau numerique : ce que fait la carte (memes regles que le code Arduino)\nlet oled = ' ', buzzer = 'silence';\nconst led = { red: 'off', blue: 'off' };\nif (S.connected) {\n    if (S.mode === 0) {\n        oled = 'Passage Prioritaire';\n        if (S.siren) { led.blue = 'alt-a'; led.red = 'alt-b'; buzzer = 'sirène 587 Hz / 440 Hz'; }\n    } else if (!S.rec) {\n        oled = 'En attente badge...';\n    } else if (S.bpm <= 0) {\n        oled = 'ARRET CARDIAQUE'; led.red = 'on'; buzzer = 'alarme continue 300 Hz';\n    } else {\n        oled = 'BPM : ' + S.bpm;\n        const anormal = S.bpm > SEUIL_HAUT || S.bpm < SEUIL_BAS;\n        led[anormal ? 'red' : 'blue'] = 'beat';\n        buzzer = 'bip 500 Hz à chaque battement';\n    }\n}\n\nconst st = S.stats;\nconst view = {\n    status, label, message,\n    connText: S.connected ? 'Carte en ligne (MQTT)' : 'Hors ligne',\n    bpmText: (S.connected && S.rec && S.got) ? String(S.bpm) : '--',\n    beating, beat: beating ? (60 / S.bpm).toFixed(2) + 's' : '1s',\n    oled, led, buzzer, badgeCount: S.badgeCount,\n    stats: {\n        min:  st.min === null ? '—' : st.min,\n        max:  st.max === null ? '—' : st.max,\n        avg:  st.n ? Math.round(st.sum / st.n) : '—',\n        n: st.n, alerts: st.alerts\n    },\n    log: S.log.slice(0, 14)\n};\n\n// ---------- 4) Sorties ----------\nconst out = [{ payload: view }, null, null, null, null, null, null];\nif (clearChart) out[1] = [{ payload: [] }];\nif (addPoint)   out[1] = [{ topic: 'BPM', payload: S.bpm },\n                          { topic: 'Seuil bas',  payload: SEUIL_BAS },\n                          { topic: 'Seuil haut', payload: SEUIL_HAUT }];\nout[2] = { payload: (S.connected && S.rec) ? S.bpm : 0 };\nif (syncSwitches) {\n    out[3] = { payload: S.connected && S.rec };\n    out[4] = { payload: S.connected && S.mode === 0 };\n    out[5] = { payload: S.connected && S.siren };\n}\nif (toast) out[6] = toast;\nreturn out;\n",
+        "outputs": 7,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 700,
+        "y": 220,
+        "wires": [
+            [
+                "lr_tpl_hero",
+                "lr_tpl_board",
+                "lr_tpl_stats",
+                "lr_tpl_log"
+            ],
+            [
+                "lr_chart"
+            ],
+            [
+                "lr_gauge"
+            ],
+            [
+                "lr_sw_rec"
+            ],
+            [
+                "lr_sw_mode"
+            ],
+            [
+                "lr_sw_siren"
+            ],
+            [
+                "lr_notif"
+            ]
+        ]
+    },
+    {
+        "id": "lr_c3",
+        "type": "comment",
+        "z": "lr_tab",
+        "name": "③ Dashboard",
+        "info": "",
+        "x": 1010,
+        "y": 90,
+        "wires": []
+    },
+    {
+        "id": "lr_tpl_hero",
+        "type": "ui-template",
+        "z": "lr_tab",
+        "group": "lr_g_patient",
+        "page": "",
+        "ui": "",
+        "name": "Patient (BPM)",
+        "order": 1,
+        "width": "5",
+        "height": "0",
+        "head": "",
+        "format": "<template>\n  <div v-if=\"msg && msg.payload\" class=\"mon-hero\" :class=\"'mon-st-' + msg.payload.status\">\n    <div class=\"mon-hero-top\">\n      <span class=\"mon-chip\">{{ msg.payload.label }}</span>\n      <span class=\"mon-chip mon-chip-soft\">{{ msg.payload.connText }}</span>\n    </div>\n    <div class=\"mon-hero-mid\">\n      <svg class=\"mon-heart\" :class=\"{ 'mon-heart-beat': msg.payload.beating }\" :style=\"{ animationDuration: msg.payload.beat }\" viewBox=\"0 0 24 24\" aria-hidden=\"true\">\n        <path fill=\"currentColor\" d=\"M12,21.35L10.55,20.03C5.4,15.36 2,12.27 2,8.5C2,5.41 4.42,3 7.5,3C9.24,3 10.91,3.81 12,5.08C13.09,3.81 14.76,3 16.5,3C19.58,3 22,5.41 22,8.5C22,12.27 18.6,15.36 13.45,20.03L12,21.35Z\"/>\n      </svg>\n      <div class=\"mon-bpm\">{{ msg.payload.bpmText }}</div>\n      <div class=\"mon-unit\">BPM</div>\n    </div>\n    <div class=\"mon-hero-msg\">{{ msg.payload.message }}</div>\n  </div>\n  <div v-else class=\"mon-hero mon-st-offline\">\n    <div class=\"mon-hero-msg\">En attente des données de la carte…</div>\n  </div>\n</template>\n\n<style>\n.mon-hero{border-radius:16px;padding:18px 20px;color:#fff;background:linear-gradient(135deg,var(--c1,#64748b),var(--c2,#94a3b8));transition:background .4s}\n.mon-st-normal{--c1:#15803d;--c2:#22c55e}\n.mon-st-bas,.mon-st-haut{--c1:#c2410c;--c2:#ef4444}\n.mon-st-arret{--c1:#7f1d1d;--c2:#dc2626;animation:mon-alarm .8s ease-in-out infinite}\n.mon-st-ambulance{--c1:#0369a1;--c2:#0ea5e9}\n.mon-st-idle{--c1:#334155;--c2:#64748b}\n.mon-st-acq{--c1:#0f766e;--c2:#14b8a6}\n.mon-st-offline{--c1:#6b7280;--c2:#9ca3af}\n.mon-hero-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}\n.mon-chip{background:rgba(255,255,255,.22);border-radius:999px;padding:4px 14px;font-weight:700;font-size:.95rem;letter-spacing:.3px}\n.mon-chip-soft{font-weight:500;font-size:.8rem;background:rgba(0,0,0,.18)}\n.mon-hero-mid{display:flex;align-items:center;justify-content:center;gap:14px;padding:14px 0 6px}\n.mon-heart{width:64px;height:64px;color:#fff;transform-origin:center}\n.mon-heart-beat{animation:mon-beat 1s ease-in-out infinite}\n.mon-bpm{font-size:5rem;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}\n.mon-unit{font-size:1.1rem;font-weight:600;opacity:.85;align-self:flex-end;padding-bottom:10px}\n.mon-hero-msg{text-align:center;font-size:.95rem;opacity:.95}\n@keyframes mon-beat{0%,100%{transform:scale(1)}15%{transform:scale(1.25)}30%{transform:scale(1)}45%{transform:scale(1.12)}}\n@keyframes mon-alarm{0%,100%{filter:none}50%{filter:brightness(1.4)}}\n</style>\n",
+        "storeOutMessages": true,
+        "passthru": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1010,
+        "y": 130,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "lr_tpl_board",
+        "type": "ui-template",
+        "z": "lr_tab",
+        "group": "lr_g_board",
+        "page": "",
+        "ui": "",
+        "name": "Carte (OLED, LED, buzzer)",
+        "order": 1,
+        "width": "4",
+        "height": "0",
+        "head": "",
+        "format": "<template>\n  <div v-if=\"msg && msg.payload\" class=\"mon-board\">\n    <div class=\"mon-oled\">\n      <div class=\"mon-oled-txt\" :class=\"{ 'mon-oled-alert': msg.payload.status === 'arret' }\">{{ msg.payload.oled }}</div>\n    </div>\n    <div class=\"mon-parts\">\n      <div class=\"mon-part\">\n        <span class=\"mon-led mon-led-blue\" :class=\"'mon-' + msg.payload.led.blue\" :style=\"{ '--beat': msg.payload.beat }\"></span>\n        <small>Bleue · D7</small>\n      </div>\n      <div class=\"mon-part\">\n        <span class=\"mon-led mon-led-red\" :class=\"'mon-' + msg.payload.led.red\" :style=\"{ '--beat': msg.payload.beat }\"></span>\n        <small>Rouge · D5</small>\n      </div>\n      <div class=\"mon-part\">\n        <span :key=\"msg.payload.badgeCount\" class=\"mon-led mon-led-green\" :class=\"{ 'mon-flash': msg.payload.badgeCount > 0 }\"></span>\n        <small>Verte · D6</small>\n      </div>\n    </div>\n    <div class=\"mon-buzzer\">🔊 Buzzer D3 : <b>{{ msg.payload.buzzer }}</b></div>\n    <div class=\"mon-buzzer\">🏷️ Badges RFID lus : <b>{{ msg.payload.badgeCount }}</b></div>\n  </div>\n  <div v-else class=\"mon-board\">En attente de la carte…</div>\n</template>\n\n<style>\n.mon-oled{background:#020617;border:3px solid #1e293b;border-radius:10px;aspect-ratio:2/1;padding:20px 16px;box-shadow:inset 0 0 22px rgba(56,189,248,.28)}\n.mon-oled-txt{font-family:ui-monospace,Menlo,Consolas,monospace;color:#7dd3fc;font-size:1.15rem;letter-spacing:.5px;text-shadow:0 0 6px rgba(125,211,252,.7)}\n.mon-oled-alert{color:#fca5a5;text-shadow:0 0 8px rgba(239,68,68,.9);animation:mon-oledblink .8s steps(2) infinite}\n.mon-parts{display:flex;justify-content:space-around;padding:16px 0 8px}\n.mon-part{display:flex;flex-direction:column;align-items:center;gap:6px}\n.mon-part small{color:#64748b;font-size:.75rem}\n.mon-led{--led:#94a3b8;width:30px;height:30px;border-radius:50%;background:#e2e8f0;border:2px solid #cbd5e1;display:inline-block}\n.mon-led-red{--led:#ef4444}.mon-led-blue{--led:#0ea5e9}.mon-led-green{--led:#22c55e}\n.mon-led.mon-on{background:var(--led);border-color:var(--led);box-shadow:0 0 14px 4px var(--led)}\n.mon-led.mon-beat{animation:mon-ledflash var(--beat,1s) linear infinite}\n.mon-led.mon-alt-a{animation:mon-alta .6s linear infinite}\n.mon-led.mon-alt-b{animation:mon-altb .6s linear infinite}\n.mon-led.mon-flash{animation:mon-ledone .8s linear 1}\n.mon-buzzer{font-size:.9rem;padding:4px 2px;color:#334155}\n@keyframes mon-ledflash{0%,20%{background:var(--led);border-color:var(--led);box-shadow:0 0 14px 4px var(--led)}30%,100%{background:#e2e8f0;border-color:#cbd5e1;box-shadow:none}}\n@keyframes mon-alta{0%,45%{background:var(--led);border-color:var(--led);box-shadow:0 0 14px 4px var(--led)}55%,100%{background:#e2e8f0;border-color:#cbd5e1;box-shadow:none}}\n@keyframes mon-altb{0%,45%{background:#e2e8f0;border-color:#cbd5e1;box-shadow:none}55%,95%{background:var(--led);border-color:var(--led);box-shadow:0 0 14px 4px var(--led)}100%{background:#e2e8f0;border-color:#cbd5e1;box-shadow:none}}\n@keyframes mon-ledone{0%,90%{background:var(--led);border-color:var(--led);box-shadow:0 0 14px 4px var(--led)}100%{background:#e2e8f0;border-color:#cbd5e1;box-shadow:none}}\n@keyframes mon-oledblink{0%{opacity:1}50%{opacity:.25}}\n</style>\n",
+        "storeOutMessages": true,
+        "passthru": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1030,
+        "y": 180,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "lr_tpl_stats",
+        "type": "ui-template",
+        "z": "lr_tab",
+        "group": "lr_g_rythme",
+        "page": "",
+        "ui": "",
+        "name": "Statistiques",
+        "order": 2,
+        "width": "4",
+        "height": "0",
+        "head": "",
+        "format": "<template>\n  <div class=\"mon-stats\">\n    <div class=\"mon-stat\"><span>Minimum</span><b>{{ msg && msg.payload ? msg.payload.stats.min : '—' }}</b></div>\n    <div class=\"mon-stat\"><span>Moyenne</span><b>{{ msg && msg.payload ? msg.payload.stats.avg : '—' }}</b></div>\n    <div class=\"mon-stat\"><span>Maximum</span><b>{{ msg && msg.payload ? msg.payload.stats.max : '—' }}</b></div>\n    <div class=\"mon-stat mon-stat-alert\"><span>Alertes</span><b>{{ msg && msg.payload ? msg.payload.stats.alerts : 0 }}</b></div>\n  </div>\n</template>\n\n<style>\n.mon-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}\n.mon-stat{background:#f1f5f9;border-radius:12px;padding:10px 6px;text-align:center;display:flex;flex-direction:column;gap:2px}\n.mon-stat span{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px}\n.mon-stat b{font-size:1.5rem;color:#0f172a;font-variant-numeric:tabular-nums}\n.mon-stat-alert b{color:#dc2626}\n</style>\n",
+        "storeOutMessages": true,
+        "passthru": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1010,
+        "y": 230,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "lr_tpl_log",
+        "type": "ui-template",
+        "z": "lr_tab",
+        "group": "lr_g_log",
+        "page": "",
+        "ui": "",
+        "name": "Journal",
+        "order": 1,
+        "width": "12",
+        "height": "0",
+        "head": "",
+        "format": "<template>\n  <div class=\"mon-log\">\n    <div v-if=\"!(msg && msg.payload && msg.payload.log && msg.payload.log.length)\" class=\"mon-log-empty\">Aucun évènement pour le moment.</div>\n    <ul v-else>\n      <li v-for=\"(e, i) in msg.payload.log\" :key=\"e.t + '-' + i\" :class=\"'mon-log-' + e.level\">\n        <span class=\"mon-log-t\">{{ e.t }}</span>\n        <span>{{ e.text }}</span>\n      </li>\n    </ul>\n  </div>\n</template>\n\n<style>\n.mon-log ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}\n.mon-log li{display:flex;gap:12px;padding:6px 10px;border-radius:8px;background:#f8fafc;border-left:4px solid #94a3b8;font-size:.9rem}\n.mon-log-t{font-family:ui-monospace,Menlo,Consolas,monospace;color:#64748b}\n.mon-log-ok{border-left-color:#22c55e!important}\n.mon-log-warn{border-left-color:#f59e0b!important}\n.mon-log-err{border-left-color:#dc2626!important;background:#fef2f2!important;font-weight:600}\n.mon-log-info{border-left-color:#0ea5e9!important}\n.mon-log-empty{color:#94a3b8;padding:8px}\n</style>\n",
+        "storeOutMessages": true,
+        "passthru": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 990,
+        "y": 280,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "lr_chart",
+        "type": "ui-chart",
+        "z": "lr_tab",
+        "group": "lr_g_histo",
+        "name": "Historique BPM",
+        "label": "",
+        "order": 1,
+        "chartType": "line",
+        "category": "topic",
+        "categoryType": "msg",
+        "xAxisLabel": "",
+        "xAxisProperty": "",
+        "xAxisPropertyType": "timestamp",
+        "xAxisType": "time",
+        "xAxisFormat": "",
+        "xAxisFormatType": "auto",
+        "xmin": "",
+        "xmax": "",
+        "yAxisLabel": "bpm",
+        "yAxisProperty": "payload",
+        "yAxisPropertyType": "msg",
+        "ymin": "0",
+        "ymax": "",
+        "bins": 10,
+        "action": "append",
+        "stackSeries": false,
+        "pointShape": "circle",
+        "pointRadius": 2,
+        "showLegend": true,
+        "removeOlder": 2,
+        "removeOlderUnit": "60",
+        "removeOlderPoints": "",
+        "colors": [
+            "#0ea5e9",
+            "#f59e0b",
+            "#f59e0b",
+            "#2ca02c",
+            "#a347e1",
+            "#d62728",
+            "#ff9896",
+            "#9467bd",
+            "#c5b0d5"
+        ],
+        "textColor": [
+            "#666666"
+        ],
+        "textColorDefault": true,
+        "gridColor": [
+            "#e5e5e5"
+        ],
+        "gridColorDefault": true,
+        "width": "8",
+        "height": "6",
+        "className": "",
+        "interpolation": "linear",
+        "x": 1000,
+        "y": 330,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "lr_gauge",
+        "type": "ui-gauge",
+        "z": "lr_tab",
+        "name": "Jauge BPM",
+        "group": "lr_g_rythme",
+        "order": 1,
+        "value": "payload",
+        "valueType": "msg",
+        "width": "4",
+        "height": "4",
+        "gtype": "gauge-half",
+        "gstyle": "needle",
+        "title": "",
+        "units": "bpm",
+        "icon": "",
+        "prefix": "",
+        "suffix": "",
+        "segments": [
+            {
+                "from": "0",
+                "color": "#ef4444"
+            },
+            {
+                "from": "50",
+                "color": "#22c55e"
+            },
+            {
+                "from": "81",
+                "color": "#ef4444"
+            }
+        ],
+        "min": 0,
+        "max": 200,
+        "sizeThickness": 16,
+        "sizeGap": 4,
+        "sizeKeyThickness": 8,
+        "styleRounded": true,
+        "styleGlow": false,
+        "className": "",
+        "x": 1000,
+        "y": 380,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "lr_sw_rec",
+        "type": "ui-switch",
+        "z": "lr_tab",
+        "name": "Enregistrement",
+        "label": "Enregistrement BPM (badge)",
+        "group": "lr_g_cmd",
+        "order": 1,
+        "width": "3",
+        "height": "1",
+        "passthru": false,
+        "decouple": false,
+        "topic": "rec",
+        "topicType": "str",
+        "style": "",
+        "className": "",
+        "layout": "row-spread",
+        "clickableArea": "switch",
+        "onvalue": "true",
+        "onvalueType": "bool",
+        "onicon": "",
+        "oncolor": "",
+        "offvalue": "false",
+        "offvalueType": "bool",
+        "officon": "",
+        "offcolor": "",
+        "x": 1010,
+        "y": 430,
+        "wires": [
+            [
+                "lr_fn_cmd"
+            ]
+        ]
+    },
+    {
+        "id": "lr_sw_mode",
+        "type": "ui-switch",
+        "z": "lr_tab",
+        "name": "Mode",
+        "label": "Mode Ambulance (bouton 2)",
+        "group": "lr_g_cmd",
+        "order": 2,
+        "width": "3",
+        "height": "1",
+        "passthru": false,
+        "decouple": false,
+        "topic": "mode",
+        "topicType": "str",
+        "style": "",
+        "className": "",
+        "layout": "row-spread",
+        "clickableArea": "switch",
+        "onvalue": "true",
+        "onvalueType": "bool",
+        "onicon": "",
+        "oncolor": "",
+        "offvalue": "false",
+        "offvalueType": "bool",
+        "officon": "",
+        "offcolor": "",
+        "x": 1010,
+        "y": 480,
+        "wires": [
+            [
+                "lr_fn_cmd"
+            ]
+        ]
+    },
+    {
+        "id": "lr_sw_siren",
+        "type": "ui-switch",
+        "z": "lr_tab",
+        "name": "Sirène",
+        "label": "Sirène (bouton 1)",
+        "group": "lr_g_cmd",
+        "order": 3,
+        "width": "3",
+        "height": "1",
+        "passthru": false,
+        "decouple": false,
+        "topic": "siren",
+        "topicType": "str",
+        "style": "",
+        "className": "",
+        "layout": "row-spread",
+        "clickableArea": "switch",
+        "onvalue": "true",
+        "onvalueType": "bool",
+        "onicon": "",
+        "oncolor": "",
+        "offvalue": "false",
+        "offvalueType": "bool",
+        "officon": "",
+        "offcolor": "",
+        "x": 1010,
+        "y": 530,
+        "wires": [
+            [
+                "lr_fn_cmd"
+            ]
+        ]
+    },
+    {
+        "id": "lr_btn_reset",
+        "type": "ui-button",
+        "z": "lr_tab",
+        "group": "lr_g_cmd",
+        "name": "Reset",
+        "label": "Réinitialiser stats & graphique",
+        "order": 4,
+        "width": "3",
+        "height": "1",
+        "emulateClick": false,
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "refresh",
+        "iconPosition": "left",
+        "payload": "{\"type\":\"reset\"}",
+        "payloadType": "json",
+        "topic": "topic",
+        "topicType": "msg",
+        "buttonColor": "#64748b",
+        "textColor": "",
+        "iconColor": "",
+        "enableClick": true,
+        "enablePointerdown": false,
+        "pointerdownPayload": "",
+        "pointerdownPayloadType": "str",
+        "pointerupPayload": "",
+        "pointerupPayloadType": "str",
+        "x": 1010,
+        "y": 580,
+        "wires": [
+            [
+                "lr_fn_state"
+            ]
+        ]
+    },
+    {
+        "id": "lr_notif",
+        "type": "ui-notification",
+        "z": "lr_tab",
+        "ui": "lr_ui_base",
+        "position": "top right",
+        "colorDefault": true,
+        "color": "#000000",
+        "displayTime": "5",
+        "showCountdown": true,
+        "outputs": 0,
+        "allowDismiss": true,
+        "dismissText": "Fermer",
+        "raw": false,
+        "className": "",
+        "name": "Alertes (toast)",
+        "x": 1000,
+        "y": 630,
+        "wires": []
+    },
+    {
+        "id": "lr_c4",
+        "type": "comment",
+        "z": "lr_tab",
+        "name": "④ Commandes : dashboard -> Arduino (topics mode, bouton1, rec)",
+        "info": "",
+        "x": 1330,
+        "y": 390,
+        "wires": []
+    },
+    {
+        "id": "lr_fn_cmd",
+        "type": "function",
+        "z": "lr_tab",
+        "name": "Commande -> Arduino",
+        "func": "// Interrupteurs du dashboard -> commandes MQTT vers l'Arduino\nconst on = (msg.payload === true || msg.payload === 'true' || msg.payload === 1);\nconst P = 'LR-ambulance/';\nswitch (msg.topic) {\n    case 'rec':   return { topic: P + 'rec',      payload: on ? 'on' : 'off' };            // badge virtuel\n    case 'mode':  return { topic: P + 'mode',     payload: on ? 'ambulance' : 'bpm' };     // bouton 2 virtuel\n    case 'siren': return { topic: P + 'bouton1',  payload: on ? 'on' : 'off' };            // bouton 1 virtuel (sirene)\n}\nreturn null;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1330,
+        "y": 440,
+        "wires": [
+            [
+                "lr_mqtt_out"
+            ]
+        ]
+    },
+    {
+        "id": "lr_mqtt_out",
+        "type": "mqtt out",
+        "z": "lr_tab",
+        "name": "-> Arduino",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "lr_broker",
+        "x": 1560,
+        "y": 440,
+        "wires": []
+    },
+    {
+        "id": "lr_inj_init",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Init dashboard",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "1",
+        "topic": "",
+        "payload": "{\"type\":\"init\"}",
+        "payloadType": "json",
+        "x": 130,
+        "y": 290,
+        "wires": [
+            [
+                "lr_fn_state"
+            ]
+        ]
+    },
+    {
+        "id": "lr_c5",
+        "type": "comment",
+        "z": "lr_tab",
+        "name": "⑤ TESTS sans Arduino : simulent les messages MQTT de la carte (dans l'ordre)",
+        "info": "",
+        "x": 180,
+        "y": 350,
+        "wires": []
+    },
+    {
+        "id": "lr_t0",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Carte en ligne",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/en_ligne",
+        "payload": "on",
+        "payloadType": "str",
+        "x": 150,
+        "y": 400,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t1",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Etat : repos",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"bpm\",\"rec\":false,\"siren\":false,\"badge\":0}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 445,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t2",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Badge : démarrage",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"bpm\",\"rec\":true,\"siren\":false,\"badge\":1}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 490,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t3",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "BPM 72 (normal)",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/bpm",
+        "payload": "72",
+        "payloadType": "str",
+        "x": 150,
+        "y": 535,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t4",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "BPM 45 (bas)",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/bpm",
+        "payload": "45",
+        "payloadType": "str",
+        "x": 150,
+        "y": 580,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t5",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "BPM 110 (haut)",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/bpm",
+        "payload": "110",
+        "payloadType": "str",
+        "x": 150,
+        "y": 625,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t6",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Pas de rythme (0)",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/bpm",
+        "payload": "0",
+        "payloadType": "str",
+        "x": 150,
+        "y": 670,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t7",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Badge : arrêt",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"bpm\",\"rec\":false,\"siren\":false,\"badge\":2}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 715,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t8",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Mode Ambulance",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"ambulance\",\"rec\":false,\"siren\":false,\"badge\":2}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 760,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t9",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Sirène ON",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"ambulance\",\"rec\":false,\"siren\":true,\"badge\":2}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 805,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t10",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Sirène OFF",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"ambulance\",\"rec\":false,\"siren\":false,\"badge\":2}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 850,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t11",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Mode Suivi BPM",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/etat",
+        "payload": "{\"mode\":\"bpm\",\"rec\":false,\"siren\":false,\"badge\":2}",
+        "payloadType": "str",
+        "x": 150,
+        "y": 895,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_t12",
+        "type": "inject",
+        "z": "lr_tab",
+        "name": "Carte hors ligne",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": "0.1",
+        "topic": "LR-ambulance/en_ligne",
+        "payload": "off",
+        "payloadType": "str",
+        "x": 150,
+        "y": 940,
+        "wires": [
+            [
+                "lr_fn_parse"
+            ]
+        ]
+    },
+    {
+        "id": "lr_broker",
+        "type": "mqtt-broker",
+        "name": "Broker public EMQX",
+        "broker": "broker.emqx.io",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "lr_g_patient",
+        "type": "ui-group",
+        "name": "Patient",
+        "page": "lr_ui_page",
+        "width": "5",
+        "height": "1",
+        "order": 1,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "lr_g_board",
+        "type": "ui-group",
+        "name": "Carte Arduino (jumeau numérique)",
+        "page": "lr_ui_page",
+        "width": "4",
+        "height": "1",
+        "order": 2,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "lr_g_rythme",
+        "type": "ui-group",
+        "name": "Rythme cardiaque",
+        "page": "lr_ui_page",
+        "width": "4",
+        "height": "1",
+        "order": 4,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "lr_g_log",
+        "type": "ui-group",
+        "name": "Journal des évènements",
+        "page": "lr_ui_page",
+        "width": "12",
+        "height": "1",
+        "order": 6,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "lr_g_histo",
+        "type": "ui-group",
+        "name": "Historique (2 dernières minutes)",
+        "page": "lr_ui_page",
+        "width": "8",
+        "height": "1",
+        "order": 5,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "lr_g_cmd",
+        "type": "ui-group",
+        "name": "Commandes",
+        "page": "lr_ui_page",
+        "width": "3",
+        "height": "1",
+        "order": 3,
+        "showTitle": true,
+        "className": "",
+        "visible": "true",
+        "disabled": "false",
+        "groupType": "default"
+    },
+    {
+        "id": "lr_ui_base",
+        "type": "ui-base",
+        "name": "Moniteur Arduino",
+        "path": "/lr",
+        "appIcon": "",
+        "includeClientData": true,
+        "acceptsClientConfig": [
+            "ui-notification",
+            "ui-control"
+        ],
+        "showPathInSidebar": false,
+        "headerContent": "page",
+        "navigationStyle": "default",
+        "titleBarStyle": "default",
+        "showReconnectNotification": true,
+        "notificationDisplayTime": 1,
+        "showDisconnectNotification": true,
+        "allowInstall": false
+    },
+    {
+        "id": "lr_ui_page",
+        "type": "ui-page",
+        "name": "Moniteur Arduino",
+        "ui": "lr_ui_base",
+        "path": "/live",
+        "icon": "heart-pulse",
+        "layout": "grid",
+        "theme": "lr_ui_theme",
+        "breakpoints": [
+            {
+                "name": "Default",
+                "px": "0",
+                "cols": "3"
+            },
+            {
+                "name": "Tablet",
+                "px": "576",
+                "cols": "6"
+            },
+            {
+                "name": "Small Desktop",
+                "px": "768",
+                "cols": "9"
+            },
+            {
+                "name": "Desktop",
+                "px": "1024",
+                "cols": "12"
+            }
+        ],
+        "order": 1,
+        "className": "",
+        "visible": "true",
+        "disabled": "false"
+    },
+    {
+        "id": "lr_ui_theme",
+        "type": "ui-theme",
+        "name": "Theme Moniteur",
+        "colors": {
+            "surface": "#ffffff",
+            "primary": "#0ea5e9",
+            "bgPage": "#eef2f7",
+            "groupBg": "#ffffff",
+            "groupOutline": "#e2e8f0"
+        },
+        "sizes": {
+            "density": "default",
+            "pagePadding": "14px",
+            "groupGap": "14px",
+            "groupBorderRadius": "14px",
+            "widgetGap": "12px"
+        }
+    },
+    {
+        "id": "87e14690767fde3b",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "@flowfuse/node-red-dashboard": "1.32.0"
+        }
+    }
+]
